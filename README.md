@@ -1,112 +1,75 @@
-# NeuralNet-for-FPGA
+# CNN-FPGA
 
-A fully parameterisable fixed-point neural network implemented in SystemVerilog and simulated with Verilator, trained on the MNIST handwritten digit dataset. The hardware implementation is bit-exact with the Python reference model.
-
----
-
-## 1. Background
-
-In a neural network we create a series of neurons, structured in layers, to map inputs to outputs. Each neuron computes a weighted sum of its inputs plus a bias:
-
-$$n_j = \sum^I_{i=0} w_{ji} x_i + b_j$$
-
-Where $I$ is the number of nodes in the previous layer and $j$ is the node in the current layer.
-
-Without an activation function this would be a purely linear system. To introduce non-linearity, each neuron applies ReLU after the accumulation:
-
-$$\mathrm{ReLU}(x) = \begin{cases} x & \text{if } x > 0 \\ 0 & \text{if } x \le 0 \end{cases}$$
-
-The network is trained on the MNIST dataset — 28×28 greyscale images of handwritten digits (0–9), giving 784 inputs per image.
-
-![MNIST Network](/assets/MNISTexmple.png)
+A Convolutional Neural Network inference accelerator implemented in SystemVerilog, extending the fixed-point fully-connected framework from [NeuralNet-for-FPGA](https://github.com/archieelth/FPGA_CNN). Trained on MNIST and simulated with Verilator.
 
 ---
 
-## 2. Python Implementation
+## Overview
 
-Training is done in floating-point Python (`fixedtest.py`) using gradient descent with backpropagation and a softmax output layer. The trained weights are then quantised to fixed-point and exported as `.hex` files for the hardware.
-
-A bit-accurate fixed-point inference function mirrors the hardware MAC behaviour exactly, allowing direct comparison between the Python model and the simulation output.
-
----
-
-## 3. Fixed-Point Representation
-
-The hardware uses **Q2.13 signed 16-bit fixed point** — 1 sign bit, 2 integer bits, 13 fractional bits. This gives a range of approximately ±4 with a precision of $2^{-13} \approx 0.000122$.
-
-The MAC operation accumulates products in a **48-bit Q4.26 accumulator** (the result of two Q2.13 multiplications), then right-shifts by 13 at the end to return to Q2.13 before adding the bias. This single-shift approach preserves precision across the entire accumulation, unlike per-multiply rounding which introduces cumulative error.
-
----
-
-## 4. Quantization-Aware Training
-
-Naively training in float and then quantising the weights introduces **quantization noise** — small rounding errors that compound across neurons and layers. This degrades accuracy compared to the float model.
-
-Quantization-aware training (QAT) addresses this by periodically snapping weights to their fixed-point representation *during* training, so the model learns to be robust to that rounding. Implemented in `scripts/quantization.py`, this:
-
-- Rounds weights to Q2.13 every N iterations during the training loop
-- Forces the gradient updates to account for the precision limits of the hardware
-- Results in weights that are already near their quantised values at export time, minimising the accuracy gap between the float and fixed-point models
-
-The benefit is that the exported weights behave consistently in hardware — the Python fixed-point inference and the hardware simulation agree bit-for-bit on every prediction.
-
----
-
-## 5. Hardware Architecture
-
-The SystemVerilog design (`rtl/`) implements a two-layer feedforward network:
+This project adds convolutional and pooling layers to the existing parameterisable FPGA neural network framework. The fully-connected layers (`layer.sv`, `neuron.sv`) are reused unchanged; the new modules handle spatial feature extraction before the FC stages.
 
 ```
-784 inputs → [Layer 1: HIDDEN_NODES neurons] → [Layer 2: 10 neurons] → argmax → digit
+28×28 input → [Conv Layer: N filters, 3×3] → [2×2 Max Pool] → [FC Layer 1] → [FC Layer 2] → argmax → digit
 ```
 
-Key modules:
+---
 
-| Module | Description |
-|---|---|
-| `network.sv` | Top-level FSM, coordinates all modules |
-| `layer.sv` | Generates N neurons in parallel via `generate` |
-| `neuron.sv` | Single neuron: MAC accumulator + ReLU |
-| `pixel_stream.sv` | Streams image pixels to Layer 1 |
-| `neuron_loader.sv` | Streams Layer 1 outputs to Layer 2 |
-| `result_finder.sv` | Argmax over Layer 2 outputs |
+## Architecture
 
-The network is **fully parameterisable** — all widths and depths are driven by four parameters at the top of `rtl/network.sv`:
+### Convolutional Layer
+
+A 3×3 sliding window traverses the 28×28 input image with stride 1, producing a 26×26 feature map per filter (no padding). The window is implemented as a **line buffer**:
+
+- Two full rows are buffered (2 × 28 registers) plus the incoming pixel
+- Each new pixel completes a valid 3×3 window once two rows are loaded
+- All filters receive the same window pixels in parallel each clock cycle
+- A position counter tracks `(row, col)` and suppresses output at row boundaries
+
+Each filter is a 9-weight neuron (dot product + ReLU), using the same MAC accumulator as the existing `neuron.sv`.
+
+### Max Pooling
+
+A 2×2 max-pool reduces each 26×26 feature map to 13×13, cutting data volume by 4× before the FC stages. Reuses the pixel streaming infrastructure with a modified stride counter.
+
+### Fully-Connected Layers
+
+The pooled, flattened feature maps feed directly into the existing `layer.sv` / `neuron.sv` modules, which are already parameterisable and require no structural changes.
+
+---
+
+## Fixed-Point Representation
+
+Inherits the **Q2.13 signed 16-bit** scheme from the parent project:
+
+| Field | Bits | Notes |
+|---|---|---|
+| Sign | 1 | |
+| Integer | 2 | Range ≈ ±4 |
+| Fractional | 13 | Precision ≈ 0.000122 |
+
+MAC products accumulate in a 48-bit Q4.26 accumulator, right-shifted by 13 at the end to return to Q2.13. Convolutional kernel weights are exported in the same `.hex` format as FC weights.
+
+---
+
+## Parameters
 
 | Parameter | Default | Description |
 |---|---|---|
-| `HIDDEN_NODES` | `64` | Hidden layer neuron count — main accuracy knob |
-| `NUMWEIGHTL1` | `784` | Input size (pixels per image) |
+| `NUM_FILTERS` | `8` | Number of 3×3 convolutional filters |
+| `HIDDEN_NODES` | `64` | FC hidden layer neuron count |
 | `DATAWIDTH` | `16` | Bit width of all data and weights |
 | `NEURONNODES` | `10` | Output classes (digits 0–9) |
 
-Counter widths throughout use `$clog2` so they automatically resize when parameters change. To change the hidden layer size, only `HIDDEN_NODES` needs updating — all downstream signal widths and instantiation parameters derive from it.
-
 ---
 
-## 6. Results
-
-All results are from the Verilator simulation. Python fixed-point inference is bit-exact with the hardware on every test.
-
-| Model | Hidden Neurons | Float Accuracy | HW Accuracy | HW == PY |
-|---|---|---|---|---|
-| `models/hidden10` | 10 | ~82% | 80% | 100% |
-| `models/hidden64` | 64 | ~91% | 95% | 100% |
-
-The jump from 10 to 64 hidden neurons gives a ~15 percentage point improvement in hardware accuracy. The 100% HW==PY agreement across all tests confirms the fixed-point Python model is a reliable predictor of hardware behaviour before synthesis.
-
-![Results hidden64](/results_hidden64.png)
-
----
-
-## 7. Project Structure
+## Project Structure
 
 ```
 rtl/              SystemVerilog source + Verilator C++ driver
 models/           Trained weights — one subfolder per configuration
 data/             MNIST CSV dataset
-test_images/      Pre-generated test images (exported by fixedtest.py)
-scripts/          Utility scripts (quantization, standalone inference, etc.)
+test_images/      Pre-generated test images
+scripts/          Utility scripts (quantization, inference, etc.)
 fixedtest.py      Train a model and export weights to models/
 testbench.py      Run hardware simulation + Python comparison + plot
 Makefile          Build system
@@ -115,29 +78,26 @@ COMMANDS.txt      Quick reference for all commands
 
 ---
 
-## 8. Usage
+## Usage
 
 **Train a model**
 ```bash
-# Set HIDDEN_SIZE in fixedtest.py, then:
 python3 fixedtest.py
 ```
 
 **Build the simulation**
 ```bash
-# Set HIDDEN_NODES in rtl/network.sv to match, then:
 make build
 ```
 
 **Run the testbench**
 ```bash
-# Set MODEL_DIR + HIDDEN_SIZE in testbench.py, then:
 python3 testbench.py
 ```
 
 **Run a single image manually**
 ```bash
-./obj_dir/Vnetwork +IMAGEFILE=test_images/image_0.hex +WEIGHTSDIR=models/hidden64
+./obj_dir/Vnetwork +IMAGEFILE=test_images/image_0.hex +WEIGHTSDIR=models/cnn_8filter
 ```
 
 **View waveforms**
@@ -149,38 +109,8 @@ See `COMMANDS.txt` for the full reference.
 
 ---
 
-Thanks for viewing my project, I hope you found it interesting.
+## Prerequisites
 
----
-
-## 9. Next Steps — Convolutional Neural Network (CNN)
-
-Building on the existing fully-connected FPGA framework, the next phase extends this project into a Convolutional Neural Network (CNN) to improve spatial feature extraction from the MNIST images.
-
-### Plan Overview
-
-**Stage 1 — Sliding Window / Convolution Layer**
-
-The 28×28 input image will be processed by a 3×3 sliding window that traverses the image with a stride of 1, producing a 26×26 feature map per filter (no padding). At each position the 9 pixels in the window are fed into a convolutional kernel — essentially a 9-weight neuron — which computes a dot product and applies ReLU.
-
-The sliding window will be implemented as a line buffer in hardware:
-- Two full rows are buffered (2 × 28 registers), plus the current pixel being streamed in
-- Once two full rows are loaded, each new incoming pixel completes a valid 3×3 window
-- The window pixels are presented to all convolutional neurons in parallel each clock cycle
-- A position counter tracks (row, col) to determine when a window is valid and to handle row-boundary conditions
-
-**Stage 2 — Multiple Filters**
-
-Several 3×3 filters will run in parallel (e.g. 8 or 16), each learning a different spatial feature (edges, curves, etc.). Each filter produces its own 26×26 feature map. The filter weights are stored in `.hex` files using the same format as the existing weight loader.
-
-**Stage 3 — Pooling**
-
-A 2×2 max-pooling layer reduces each 26×26 feature map to 13×13, cutting the data volume by 4× before the fully-connected stages. This reuses the existing pixel streaming infrastructure with a modified stride counter.
-
-**Stage 4 — Flatten + Fully-Connected Layers**
-
-The pooled feature maps are flattened into a 1D vector and fed into the existing fully-connected layer architecture (the current `layer.sv` / `neuron.sv` modules), which are already parameterisable and require no structural changes.
-
-**Stage 5 — Training & Weight Export**
-
-A Python CNN will be trained (PyTorch or NumPy) with quantization-aware training matching the existing Q2.13 fixed-point scheme. Convolutional kernel weights will be exported as `.hex` files alongside the existing FC weight files.
+- [Verilator](https://verilator.org/) ≥ 4.0
+- Python 3 with `numpy`, `matplotlib`
+- (Optional) GTKWave for waveform viewing
