@@ -150,3 +150,37 @@ See `COMMANDS.txt` for the full reference.
 ---
 
 Thanks for viewing my project, I hope you found it interesting.
+
+---
+
+## 9. Next Steps — Convolutional Neural Network (CNN)
+
+Building on the existing fully-connected FPGA framework, the next phase extends this project into a Convolutional Neural Network (CNN) to improve spatial feature extraction from the MNIST images.
+
+### Plan Overview
+
+**Stage 1 — Sliding Window / Convolution Layer**
+
+The 28×28 input image will be processed by a 3×3 sliding window that traverses the image with a stride of 1, producing a 26×26 feature map per filter (no padding). At each position the 9 pixels in the window are fed into a convolutional kernel — essentially a 9-weight neuron — which computes a dot product and applies ReLU.
+
+The sliding window will be implemented as a line buffer in hardware:
+- Two full rows are buffered (2 × 28 registers), plus the current pixel being streamed in
+- Once two full rows are loaded, each new incoming pixel completes a valid 3×3 window
+- The window pixels are presented to all convolutional neurons in parallel each clock cycle
+- A position counter tracks (row, col) to determine when a window is valid and to handle row-boundary conditions
+
+**Stage 2 — Multiple Filters**
+
+Several 3×3 filters will run in parallel (e.g. 8 or 16), each learning a different spatial feature (edges, curves, etc.). Each filter produces its own 26×26 feature map. The filter weights are stored in `.hex` files using the same format as the existing weight loader.
+
+**Stage 3 — Pooling**
+
+A 2×2 max-pooling layer reduces each 26×26 feature map to 13×13, cutting the data volume by 4× before the fully-connected stages. This reuses the existing pixel streaming infrastructure with a modified stride counter.
+
+**Stage 4 — Flatten + Fully-Connected Layers**
+
+The pooled feature maps are flattened into a 1D vector and fed into the existing fully-connected layer architecture (the current `layer.sv` / `neuron.sv` modules), which are already parameterisable and require no structural changes.
+
+**Stage 5 — Training & Weight Export**
+
+A Python CNN will be trained (PyTorch or NumPy) with quantization-aware training matching the existing Q2.13 fixed-point scheme. Convolutional kernel weights will be exported as `.hex` files alongside the existing FC weight files.
